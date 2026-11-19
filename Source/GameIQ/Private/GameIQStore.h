@@ -24,7 +24,9 @@ public:
 	/** Open (creating if needed) the project index read-write and ensure the schema.
 	 *  Self-heals: an inconsistent schema (missing tables despite a stamped user_version)
 	 *  is rebuilt from scratch, and the extract hash caches are invalidated via a fresh
-	 *  dbGeneration so the next build doesn't skip "unchanged" assets against an empty DB. */
+	 *  dbGeneration so the next build doesn't skip "unchanged" assets against an empty DB.
+	 *  A damaged file (PRAGMA quick_check, run once per path per process, or a write that failed
+	 *  with "malformed") is moved aside as index.db.corrupt-<utc> and recreated the same way. */
 	bool Open();
 
 	/** Open a specific DB file (tests). Same schema/self-heal behavior. */
@@ -80,6 +82,9 @@ public:
 	void SetMeta(const FString& Key, const FString& Value);
 	FString GetMeta(const FString& Key);
 
+	/** Meta key holding one producer's last ingest time ("producerIngestAtIso:<producer>"). */
+	static FString ProducerIngestKey(const FString& Producer);
+
 	/** Row counts for verification/health: entities, edges, chunks. */
 	void GetCounts(int64& OutEntities, int64& OutEdges, int64& OutChunks);
 
@@ -90,10 +95,15 @@ private:
 	FSQLiteDatabase Db;
 	FString OpenedPath;
 
+	/** Stamp the global and the per-producer last-ingest meta (issue #29). */
+	void StampIngest(const FString& Producer);
+
 	/** Execute one statement, logging on failure. */
 	bool Exec(const TCHAR* Sql);
 	/** BEGIN IMMEDIATE with bounded retries on lock contention. */
 	bool BeginTransaction();
+	/** COMMIT; on failure ROLLBACK so the connection is not left mid-transaction. */
+	bool Commit();
 	bool EnsureSchema();
 	/** True if all core tables exist (schema consistent with user_version). */
 	bool SchemaLooksValid();

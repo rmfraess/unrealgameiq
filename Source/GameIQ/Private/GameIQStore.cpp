@@ -1,12 +1,14 @@
 // Copyright Buckley Builds LLC. All Rights Reserved.
 
 #include "GameIQStore.h"
+#include "GameIQSqlBind.h"
 
 #include "Dom/JsonObject.h"
 #include "GameIQJson.h"
 #include "GameIQTextUtil.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/DateTime.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
@@ -71,7 +73,14 @@ namespace
 		TEXT("INSERT INTO chunks_fts(rowid, text, aux) SELECT rowid, text, COALESCE(aux,'') FROM chunks;"),
 	};
 
-	constexpr int32 SchemaMigrations = 4; // C++ store schema version (TS store retired)
+	// Issue #31: drop self-edges already in older indexes (InsertEdge refuses new ones). Plus an
+	// index on edge type: the unused / loads-by-path / plays-* queries filter by it.
+	const TCHAR* Migration5[] = {
+		TEXT("DELETE FROM edges WHERE src = dst;"),
+		TEXT("CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);"),
+	};
+
+	constexpr int32 SchemaMigrations = 5; // C++ store schema version (TS store retired)
 
 	FString AsObject(const FJsonObject& O, const TCHAR* Field)
 	{
@@ -84,6 +93,31 @@ namespace
 			return S;
 		}
 		return FString(); // empty => bind NULL
+	}
+
+	/** True if a SQLite error text means the file itself is damaged (SQLITE_CORRUPT / SQLITE_NOTADB),
+	 *  as opposed to a transient lock or a bad statement. */
+	bool IsCorruptionError(const FString& Error)
+	{
+		return Error.Contains(TEXT("malformed")) || Error.Contains(TEXT("corrupt"))
+			|| Error.Contains(TEXT("not a database"));
+	}
+
+	/** Index files proven damaged this process (by an integrity check or a write error); the next
+	 *  Open() quarantines them instead of writing into a broken b-tree. Every patch after the first
+	 *  "malformed" error otherwise fails the same way, one warning per saved asset. */
+	TSet<FString> GCorruptPaths;
+	/** Index files whose integrity was already checked this process (the check reads the whole file,
+	 *  so it runs once per path per process, not on every save-hook patch). */
+	TSet<FString> GCheckedPaths;
+
+	/** Move a damaged index aside (kept for diagnosis) so a fresh one can be created in its place. */
+	bool QuarantineDbFile(const FString& DbPath)
+	{
+		const FString Stamp = FDateTime::UtcNow().ToString(TEXT("%Y%m%dT%H%M%SZ"));
+		const FString Dest = DbPath + TEXT(".corrupt-") + Stamp;
+		IFileManager::Get().Delete(*(DbPath + TEXT("-journal")), false, true, true);
+		return IFileManager::Get().Move(*Dest, *DbPath, /*Replace=*/true, /*EvenIfReadOnly=*/true);
 	}
 
 	const FJsonObject* AsObjectPtr(const TSharedPtr<FJsonValue>& V)
@@ -116,7 +150,7 @@ FString FGameIQStore::ReadMetaValue(const FString& Key)
 		FSQLitePreparedStatement Stmt(Db, TEXT("SELECT value FROM meta WHERE key = ?"));
 		if (Stmt.IsValid())
 		{
-			Stmt.SetBindingValueByIndex(1, Key);
+			GameIQSql::Bind(Stmt, 1, Key);
 			if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				Stmt.GetColumnValueByName(TEXT("value"), Value);
@@ -154,6 +188,77 @@ bool FGameIQStore::OpenInternal(const FString& DbPath, bool bAllowRecreate)
 	Exec(TEXT("PRAGMA synchronous=NORMAL;"));
 	Exec(TEXT("PRAGMA busy_timeout=3000;"));
 	Exec(TEXT("PRAGMA foreign_keys=OFF;"));
+
+	// Page-level damage (out-of-order rowids, a wrong freelist) is invisible to the schema check
+	// below, and a full rebuild would write straight into the broken b-trees and keep failing.
+	// Check the file once per process (and whenever a write reported corruption), and quarantine
+	// it so the rebuild starts from a clean file.
+	if (bAllowRecreate)
+	{
+		const FString Canon = FPaths::ConvertRelativePathToFull(DbPath);
+		bool bCorrupt = GCorruptPaths.Contains(Canon);
+		if (!bCorrupt && !GCheckedPaths.Contains(Canon))
+		{
+			GCheckedPaths.Add(Canon);
+			const double Start = FPlatformTime::Seconds();
+			FString Result;
+			FSQLitePreparedStatement Check(Db, TEXT("PRAGMA quick_check(1);"));
+			if (!Check.IsValid())
+			{
+				bCorrupt = IsCorruptionError(Db.GetLastError());
+			}
+			else if (Check.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				Check.GetColumnValueByIndex(0, Result);
+				bCorrupt = !Result.Equals(TEXT("ok"), ESearchCase::IgnoreCase);
+			}
+			else
+			{
+				bCorrupt = IsCorruptionError(Db.GetLastError());
+			}
+			Check.Destroy();
+			UE_LOG(LogGameIQStore, Log, TEXT("Game IQ: index integrity check %s in %.2fs (%s)"),
+				bCorrupt ? TEXT("FAILED") : TEXT("ok"), FPlatformTime::Seconds() - Start, *DbPath);
+			if (bCorrupt && !Result.IsEmpty())
+			{
+				UE_LOG(LogGameIQStore, Warning, TEXT("Game IQ: integrity check: %s"), *Result);
+			}
+		}
+		if (bCorrupt)
+		{
+			StmtCache.Empty();
+			Db.Close();
+			GCorruptPaths.Remove(Canon);
+			if (!QuarantineDbFile(DbPath))
+			{
+				UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: index at %s is corrupt and could not be moved aside (is another process holding it?). Close it and run GameIQ.Rebuild full."), *DbPath);
+				GCorruptPaths.Add(Canon); // keep refusing writes into it
+				return false;
+			}
+			UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: index at %s was corrupt — moved aside as %s.corrupt-* and recreated empty. Run GameIQ.Rebuild full to repopulate it."), *DbPath, *FPaths::GetCleanFilename(DbPath));
+			if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWriteCreate))
+			{
+				UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: could not recreate index at %s: %s"), *DbPath, *Db.GetLastError());
+				return false;
+			}
+			Exec(TEXT("PRAGMA journal_mode=DELETE;"));
+			Exec(TEXT("PRAGMA synchronous=NORMAL;"));
+			Exec(TEXT("PRAGMA busy_timeout=3000;"));
+			Exec(TEXT("PRAGMA foreign_keys=OFF;"));
+			if (!EnsureSchema())
+			{
+				UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: schema creation failed on a fresh DB at %s — giving up."), *DbPath);
+				Close();
+				return false;
+			}
+			InvalidateExtractCaches();
+		}
+	}
+	else if (GCorruptPaths.Contains(FPaths::ConvertRelativePathToFull(DbPath)))
+	{
+		Close();
+		return false;
+	}
 
 	if (!EnsureSchema())
 	{
@@ -211,10 +316,29 @@ bool FGameIQStore::Exec(const TCHAR* Sql)
 {
 	if (!Db.Execute(Sql))
 	{
-		UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: SQL failed: %s — %s"), Sql, *Db.GetLastError());
+		const FString Error = Db.GetLastError();
+		UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: SQL failed: %s — %s"), Sql, *Error);
+		if (IsCorruptionError(Error) && !OpenedPath.IsEmpty())
+		{
+			// The next Open() quarantines the file instead of patching into it again.
+			const FString Canon = FPaths::ConvertRelativePathToFull(OpenedPath);
+			if (!GCorruptPaths.Contains(Canon))
+			{
+				GCorruptPaths.Add(Canon);
+				UE_LOG(LogGameIQStore, Error, TEXT("Game IQ: the index file is damaged; it will be moved aside and recreated on the next write. Run GameIQ.Rebuild full afterwards."));
+			}
+		}
 		return false;
 	}
 	return true;
+}
+
+bool FGameIQStore::Commit()
+{
+	if (Exec(TEXT("COMMIT;"))) { return true; }
+	// Leave the connection usable: a failed COMMIT keeps the transaction open otherwise.
+	Db.Execute(TEXT("ROLLBACK;"));
+	return false;
 }
 
 bool FGameIQStore::BeginTransaction()
@@ -251,7 +375,7 @@ bool FGameIQStore::SchemaLooksValid()
 	{
 		FSQLitePreparedStatement Stmt(Db, TEXT("SELECT 1 FROM sqlite_master WHERE name = ?"));
 		if (!Stmt.IsValid()) { return false; }
-		Stmt.SetBindingValueByIndex(1, FString(Table));
+		GameIQSql::Bind(Stmt, 1, FString(Table));
 		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row)
 		{
 			UE_LOG(LogGameIQStore, Warning, TEXT("Game IQ: required table '%s' is missing."), Table);
@@ -290,6 +414,7 @@ bool FGameIQStore::EnsureSchema()
 	if (Version < 2 && !RunMigration(Migration2, UE_ARRAY_COUNT(Migration2), 2)) { return false; }
 	if (Version < 3 && !RunMigration(Migration3, UE_ARRAY_COUNT(Migration3), 3)) { return false; }
 	if (Version < 4 && !RunMigration(Migration4, UE_ARRAY_COUNT(Migration4), 4)) { return false; }
+	if (Version < 5 && !RunMigration(Migration5, UE_ARRAY_COUNT(Migration5), 5)) { return false; }
 	return SchemaLooksValid();
 }
 
@@ -309,8 +434,8 @@ void FGameIQStore::SetMeta(const FString& Key, const FString& Value)
 	FSQLitePreparedStatement& Stmt = GetCachedStmt(
 		TEXT("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"));
 	if (!Stmt.IsValid()) { return; }
-	Stmt.SetBindingValueByIndex(1, Key);
-	Stmt.SetBindingValueByIndex(2, Value);
+	GameIQSql::Bind(Stmt, 1, Key);
+	GameIQSql::Bind(Stmt, 2, Value);
 	Stmt.Execute();
 }
 
@@ -320,7 +445,7 @@ FString FGameIQStore::GetMeta(const FString& Key)
 	FSQLitePreparedStatement& Stmt = GetCachedStmt(TEXT("SELECT value FROM meta WHERE key = ?"));
 	if (!Stmt.IsValid()) { return Value; }
 	Stmt.Reset();
-	Stmt.SetBindingValueByIndex(1, Key);
+	GameIQSql::Bind(Stmt, 1, Key);
 	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
 		Stmt.GetColumnValueByName(TEXT("value"), Value);
@@ -352,7 +477,7 @@ int64 FGameIQStore::CountChunksForProducer(const FString& Producer)
 	int64 N = 0;
 	if (Stmt.IsValid())
 	{
-		Stmt.SetBindingValueByIndex(1, Producer);
+		GameIQSql::Bind(Stmt, 1, Producer);
 		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			Stmt.GetColumnValueByIndex(0, N);
@@ -370,28 +495,28 @@ void FGameIQStore::UpsertEntity(const FJsonObject& E, const FString& Producer)
 		     "parent=excluded.parent, source=excluded.source, summary=excluded.summary, "
 		     "detail=excluded.detail, producer=excluded.producer, authority=excluded.authority"));
 	if (!Stmt.IsValid()) { return; }
-	Stmt.SetBindingValueByIndex(1, E.GetStringField(TEXT("id")));
-	Stmt.SetBindingValueByIndex(2, E.GetStringField(TEXT("kind")));
-	Stmt.SetBindingValueByIndex(3, E.GetStringField(TEXT("name")));
-	Stmt.SetBindingValueByIndex(4, E.GetStringField(TEXT("path")));
+	GameIQSql::Bind(Stmt, 1, E.GetStringField(TEXT("id")));
+	GameIQSql::Bind(Stmt, 2, E.GetStringField(TEXT("kind")));
+	GameIQSql::Bind(Stmt, 3, E.GetStringField(TEXT("name")));
+	GameIQSql::Bind(Stmt, 4, E.GetStringField(TEXT("path")));
 	FString Parent;
-	if (E.TryGetStringField(TEXT("parent"), Parent) && !Parent.IsEmpty()) { Stmt.SetBindingValueByIndex(5, Parent); }
+	if (E.TryGetStringField(TEXT("parent"), Parent) && !Parent.IsEmpty()) { GameIQSql::Bind(Stmt, 5, Parent); }
 	else { Stmt.SetBindingValueByIndex(5); } // NULL
-	Stmt.SetBindingValueByIndex(6, E.GetStringField(TEXT("source")));
+	GameIQSql::Bind(Stmt, 6, E.GetStringField(TEXT("source")));
 	FString Summary;
-	if (E.TryGetStringField(TEXT("summary"), Summary) && !Summary.IsEmpty()) { Stmt.SetBindingValueByIndex(7, Summary); }
+	if (E.TryGetStringField(TEXT("summary"), Summary) && !Summary.IsEmpty()) { GameIQSql::Bind(Stmt, 7, Summary); }
 	else { Stmt.SetBindingValueByIndex(7); }
 	const FString Detail = AsObject(E, TEXT("detail"));
-	if (!Detail.IsEmpty()) { Stmt.SetBindingValueByIndex(8, Detail); }
+	if (!Detail.IsEmpty()) { GameIQSql::Bind(Stmt, 8, Detail); }
 	else { Stmt.SetBindingValueByIndex(8); }
-	Stmt.SetBindingValueByIndex(9, Producer);
+	GameIQSql::Bind(Stmt, 9, Producer);
 	// Provenance: a producer omits `authority` for extracted ground truth; docs set 'stated-intent'.
 	FString AuthorityTag;
 	if (!(E.TryGetStringField(TEXT("authority"), AuthorityTag) && !AuthorityTag.IsEmpty()))
 	{
 		AuthorityTag = GameIQ::Authority::ExtractedFact;
 	}
-	Stmt.SetBindingValueByIndex(10, AuthorityTag);
+	GameIQSql::Bind(Stmt, 10, AuthorityTag);
 	Stmt.Execute();
 }
 
@@ -401,13 +526,18 @@ void FGameIQStore::InsertEdge(const FJsonObject& E, const FString& Producer)
 		TEXT("INSERT INTO edges (src, dst, type, attrs, producer) VALUES (?, ?, ?, ?, ?) "
 		     "ON CONFLICT(src, dst, type) DO UPDATE SET attrs=excluded.attrs, producer=excluded.producer"));
 	if (!Stmt.IsValid()) { return; }
-	Stmt.SetBindingValueByIndex(1, E.GetStringField(TEXT("src")));
-	Stmt.SetBindingValueByIndex(2, E.GetStringField(TEXT("dst")));
-	Stmt.SetBindingValueByIndex(3, E.GetStringField(TEXT("type")));
+	const FString Src = E.GetStringField(TEXT("src"));
+	const FString Dst = E.GetStringField(TEXT("dst"));
+	// Self-edges carry no relationship (an asset's ThumbnailInfo / InternalCollection subobject
+	// "references" its own package) and made every such asset look used (issue #31).
+	if (Src.IsEmpty() || Dst.IsEmpty() || Src == Dst) { return; }
+	GameIQSql::Bind(Stmt, 1, Src);
+	GameIQSql::Bind(Stmt, 2, Dst);
+	GameIQSql::Bind(Stmt, 3, E.GetStringField(TEXT("type")));
 	const FString Attrs = AsObject(E, TEXT("attrs"));
-	if (!Attrs.IsEmpty()) { Stmt.SetBindingValueByIndex(4, Attrs); }
+	if (!Attrs.IsEmpty()) { GameIQSql::Bind(Stmt, 4, Attrs); }
 	else { Stmt.SetBindingValueByIndex(4); }
-	Stmt.SetBindingValueByIndex(5, Producer);
+	GameIQSql::Bind(Stmt, 5, Producer);
 	Stmt.Execute();
 }
 
@@ -422,12 +552,12 @@ void FGameIQStore::InsertChunk(const FJsonObject& C, const FString& Producer)
 		     "ON CONFLICT(id) DO UPDATE SET entity_id=excluded.entity_id, kind=excluded.kind, "
 		     "text=excluded.text, producer=excluded.producer, aux=excluded.aux"));
 	if (!Stmt.IsValid()) { return; }
-	Stmt.SetBindingValueByIndex(1, ChunkId);
-	Stmt.SetBindingValueByIndex(2, EntityId);
-	Stmt.SetBindingValueByIndex(3, C.GetStringField(TEXT("kind")));
-	Stmt.SetBindingValueByIndex(4, Text);
-	Stmt.SetBindingValueByIndex(5, Producer);
-	Stmt.SetBindingValueByIndex(6, GameIQText::BuildAuxTokens(EntityId, Text));
+	GameIQSql::Bind(Stmt, 1, ChunkId);
+	GameIQSql::Bind(Stmt, 2, EntityId);
+	GameIQSql::Bind(Stmt, 3, C.GetStringField(TEXT("kind")));
+	GameIQSql::Bind(Stmt, 4, Text);
+	GameIQSql::Bind(Stmt, 5, Producer);
+	GameIQSql::Bind(Stmt, 6, GameIQText::BuildAuxTokens(EntityId, Text));
 	Stmt.Execute();
 }
 
@@ -440,7 +570,7 @@ void FGameIQStore::DeleteByProducer(const FString& Producer)
 		TEXT("DELETE FROM entities WHERE producer = ?") })
 	{
 		FSQLitePreparedStatement& Stmt = GetCachedStmt(Sql);
-		if (Stmt.IsValid()) { Stmt.SetBindingValueByIndex(1, Producer); Stmt.Execute(); }
+		if (Stmt.IsValid()) { GameIQSql::Bind(Stmt, 1, Producer); Stmt.Execute(); }
 	}
 }
 
@@ -459,7 +589,7 @@ TArray<FString> FGameIQStore::CollectSubtreeIds(const FString& RootId)
 			FSQLitePreparedStatement& Stmt = GetCachedStmt(TEXT("SELECT id FROM entities WHERE parent = ?"));
 			if (!Stmt.IsValid()) { continue; }
 			Stmt.Reset(); // manual Step() loop doesn't auto-reset like Execute() does — must rewind before reuse
-			Stmt.SetBindingValueByIndex(1, P);
+			GameIQSql::Bind(Stmt, 1, P);
 			while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				FString Kid;
@@ -482,7 +612,7 @@ void FGameIQStore::DeleteSubtree(const FString& RootId)
 			TEXT("DELETE FROM entities WHERE id = ?") })
 		{
 			FSQLitePreparedStatement& Stmt = GetCachedStmt(Sql);
-			if (Stmt.IsValid()) { Stmt.SetBindingValueByIndex(1, Id); Stmt.Execute(); }
+			if (Stmt.IsValid()) { GameIQSql::Bind(Stmt, 1, Id); Stmt.Execute(); }
 		}
 	}
 }
@@ -501,8 +631,8 @@ void FGameIQStore::DeleteSubtreeForProducer(const FString& RootId, const FString
 			FSQLitePreparedStatement& Stmt = GetCachedStmt(Sql);
 			if (Stmt.IsValid())
 			{
-				Stmt.SetBindingValueByIndex(1, Id);
-				Stmt.SetBindingValueByIndex(2, Producer);
+				GameIQSql::Bind(Stmt, 1, Id);
+				GameIQSql::Bind(Stmt, 2, Producer);
 				Stmt.Execute();
 			}
 		}
@@ -549,8 +679,8 @@ bool FGameIQStore::Patch(
 	if (!BeginTransaction()) { return false; }
 	for (const FString& Root : Roots) { DeleteSubtree(Root); }
 	InsertRows(Entities, Edges, Chunks, Producer);
-	SetMeta(TEXT("lastIngestAtIso"), FDateTime::UtcNow().ToIso8601());
-	return Exec(TEXT("COMMIT;"));
+	StampIngest(Producer);
+	return Commit();
 }
 
 bool FGameIQStore::PatchProducerScoped(
@@ -564,8 +694,8 @@ bool FGameIQStore::PatchProducerScoped(
 	if (!BeginTransaction()) { return false; }
 	for (const FString& Root : Replaces) { DeleteSubtreeForProducer(Root, Producer); }
 	InsertRows(Entities, Edges, Chunks, Producer);
-	SetMeta(TEXT("lastIngestAtIso"), FDateTime::UtcNow().ToIso8601());
-	return Exec(TEXT("COMMIT;"));
+	StampIngest(Producer);
+	return Commit();
 }
 
 bool FGameIQStore::IngestProducer(
@@ -578,8 +708,23 @@ bool FGameIQStore::IngestProducer(
 	if (!BeginTransaction()) { return false; }
 	DeleteByProducer(Producer);
 	InsertRows(Entities, Edges, Chunks, Producer);
-	SetMeta(TEXT("lastIngestAtIso"), FDateTime::UtcNow().ToIso8601());
-	return Exec(TEXT("COMMIT;"));
+	StampIngest(Producer);
+	return Commit();
+}
+
+FString FGameIQStore::ProducerIngestKey(const FString& Producer)
+{
+	return FString(TEXT("producerIngestAtIso:")) + Producer;
+}
+
+void FGameIQStore::StampIngest(const FString& Producer)
+{
+	// The global stamp moves on every write (the C++ auto-reindex alone refreshed it 20 times a
+	// day), so it hid a docs extract that was three days old. Keep one stamp per producer as well,
+	// so every response and Doctor can say how fresh each source is (issue #29).
+	const FString Now = FDateTime::UtcNow().ToIso8601();
+	SetMeta(TEXT("lastIngestAtIso"), Now);
+	if (!Producer.IsEmpty()) { SetMeta(ProducerIngestKey(Producer), Now); }
 }
 
 void FGameIQStore::SetProjectMeta(const FString& Name, const FString& Root, const FString& GeneratedAtIso)

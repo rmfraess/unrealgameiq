@@ -2,10 +2,12 @@
 
 #include "GameIQModule.h"
 
+#include "Editor.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Docking/TabManager.h"
 #include "GameIQBuildRunner.h"
 #include "GameIQPanel.h"
+#include "GameIQProjectChecks.h"
 #include "GameIQToolset.h"
 #include "HAL/FileManager.h"
 #include "Interfaces/IPluginManager.h"
@@ -112,8 +114,8 @@ static void GenerateGameIQAgentConfig(const TArray<FString>& Args, FOutputDevice
 		return;
 	}
 
-	const FString BeginMarker = TEXT("<!-- BEGIN GameIQ agent guidance -->");
-	const FString EndMarker = TEXT("<!-- END GameIQ agent guidance -->");
+	const FString BeginMarker = GameIQAgentFiles::BeginMarker();
+	const FString EndMarker = GameIQAgentFiles::EndMarker();
 
 	// Older bundled samples carried the guidance markers themselves; strip any embedded copies so
 	// the block (wrapped in markers below) never nests them — nested markers break the refresh
@@ -200,6 +202,12 @@ static void GenerateGameIQAgentConfig(const TArray<FString>& Args, FOutputDevice
 		}
 	}
 
+	// The index is local, machine-specific and rebuilt on demand: keep it out of git (issue #37).
+	if (GameIQAgentFiles::EnsureGitignore(ProjectRoot))
+	{
+		Ar.Logf(TEXT("GameIQ.GenerateAgentConfig: added .gameiq/ to %s"), *FPaths::Combine(ProjectRoot, TEXT(".gitignore")));
+	}
+
 	Ar.Logf(TEXT("GameIQ.GenerateAgentConfig: done (source: %s)."), *SamplePath);
 }
 
@@ -261,8 +269,9 @@ void FGameIQModule::StartupModule()
 	UE_LOG(LogGameIQ, Log, TEXT("Game IQ module started. Run `-run=GameIQBuild` to build the index."));
 
 	// The ToolsetRegistry + editor UI need the editor up. Register now if it already is (hot-reload /
-	// late load), otherwise wait for PostEngineInit.
-	if (UToolsetRegistry::IsAvailable())
+	// late load), otherwise wait for PostEngineInit. IsAvailable() itself logs a warning while
+	// GEditor is still null, which is the normal state during module load.
+	if (GEditor)
 	{
 		RegisterToolsets();
 		RegisterUI();
