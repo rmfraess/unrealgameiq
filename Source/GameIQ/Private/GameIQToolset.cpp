@@ -38,12 +38,6 @@ FString UGameIQService::Explain(const FString& Topic, const FString& DetailLevel
 	return GameIQQuery::Explain(Topic, /*Limit=*/8, DetailLevel, MaxChars, Kinds, Depth, Format);
 }
 
-FString UGameIQService::GetBlueprintContext(const FString& IdOrPath, const FString& DetailLevel,
-	int32 MaxChars, const FString& Format)
-{
-	return GameIQQuery::GetBlueprintContext(IdOrPath, DetailLevel, MaxChars, Format);
-}
-
 FString UGameIQService::ExportGraph(const FString& TopicOrId, const FString& Format,
 	const FString& Direction, int32 Depth, const FString& EdgeTypes, const FString& Kinds, int32 MaxNodes)
 {

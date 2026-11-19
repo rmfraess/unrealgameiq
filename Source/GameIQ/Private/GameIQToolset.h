@@ -67,11 +67,6 @@ public:
 		int32 MaxChars = 40000, const FString& Kinds = TEXT(""), int32 Depth = 1,
 		const FString& Format = TEXT("json"));
 
-	/** Export one Blueprint's compact context by GameIQ id or /Game path. */
-	UFUNCTION(BlueprintCallable, meta = (AICallable, AIAccessMode = "Read"), Category = "GameIQ")
-	static FString GetBlueprintContext(const FString& IdOrPath, const FString& DetailLevel = TEXT("logic"),
-		int32 MaxChars = 40000, const FString& Format = TEXT("json"));
-
 	/** Export a bounded project graph as Mermaid, Graphviz DOT, or structured JSON. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable, AIAccessMode = "Read"), Category = "GameIQ")
 	static FString ExportGraph(const FString& TopicOrId, const FString& Format = TEXT("mermaid"),

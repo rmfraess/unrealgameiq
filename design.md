@@ -165,7 +165,6 @@ Game IQ ships `UGameIQService`, an in-process UE 5.9 `UToolsetDefinition` expose
 | `references(id, direction, depth?, edgeType?, kind?)` | Who uses this / what it uses. `edgeType` filters the relation (`uses-skeleton`, `placed-in-level`, …); `kind` filters the result entity kind. |
 | `impact(id, limit?)` | Transitive "what could break if I change or delete this," severity-ranked by edge type — top-N rows plus full per-kind counts and a `truncated` flag (a hub asset no longer dumps thousands of entities). |
 | `explain(topic, detailLevel, maxChars, kinds, depth, format)` | Strictly character-budgeted JSON/Markdown context pack. |
-| `get_blueprint_context(idOrPath, detailLevel, maxChars, format)` | Compact, prioritized Blueprint pseudocode/recipe export. |
 | `export_graph(topicOrId, format, direction, depth, edgeTypes, kinds, maxNodes)` | Deterministic Mermaid, DOT, or JSON graph. |
 | `create/list/delete_snapshot` | Named, consistent local SQLite snapshots with metadata. |
 | `changes(since, until, kind, pathPrefix, limit, offset)` | Semantic entity, Blueprint logic, and relationship changes. `since`/`until` take a snapshot id, `current`, a git ref or an ISO time; the editor snapshots the index each time git HEAD moves. |

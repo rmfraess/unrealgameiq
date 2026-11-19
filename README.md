@@ -25,7 +25,7 @@ The plugin does everything in-process:
   `<project>/.gameiq/extract/*.json`. HTML headings become searchable document sections; scripts,
   styles, comments, and markup are omitted from the indexed text.
 - **Store & query** — a SQLite index (`.gameiq/index.db`, FTS5) via UE's `SQLiteCore`, with the query
-  engine (`search`/`get_entity`/`children`/`references`/`impact`/`explain`/`get_blueprint_context`/
+  engine (`search`/`get_entity`/`children`/`references`/`impact`/`explain`/
   `export_graph`/`snapshots`/`changes`/`project_stats`/`drift`/`coverage`/`doctor`) ported to C++.
 - **Serve** — `UGameIQService`, a `UToolsetDefinition` registered on UE 5.9's native `ToolsetRegistry`,
   so GameIQ's queries appear on Epic's MCP endpoint for any agent already on the built-in UE MCP or
@@ -119,7 +119,6 @@ agent on the native UE MCP (or VibeUE) can call it with no setup:
 | `References` | who uses this / what this uses (`Direction`, `Depth`, `EdgeType` filter) |
 | `Impact` | what could break if this changes (severity-ranked dependents) |
 | `Explain` | character-budgeted context bundle; detail, kind, depth, and JSON/Markdown controls |
-| `GetBlueprintContext` | compact Blueprint identity and prioritized pseudocode/recipe chunks by id or path |
 | `ExportGraph` | deterministic bounded graph in Mermaid, Graphviz DOT, or structured JSON |
 | `CreateSnapshot` / `ListSnapshots` / `DeleteSnapshot` | manage named, consistent local index snapshots |
 | `Changes` | semantic entity, Blueprint logic, and relationship changes since a snapshot, a git ref (`HEAD~3`) or a time |
@@ -149,7 +148,7 @@ Use a context pack when an agent needs portable system or Blueprint context with
 ```python
 import unreal
 context = unreal.GameIQService.explain("combat damage", "standard", 20000, "blueprint,cpp-class", 2, "markdown")
-blueprint = unreal.GameIQService.get_blueprint_context("/Game/Combat/BP_Damage", "logic", 12000, "json")
+blueprint = await call_tool("BlueprintToolsets.BlueprintDslToolset.Read", assetPath="/Game/Combat/BP_Damage.BP_Damage", scope="")
 diagram = unreal.GameIQService.export_graph("combat damage", "mermaid", "both", 2, "", "", 75)
 ```
 
